@@ -39,13 +39,13 @@ class handshake_message:
 
 
 class actual_message:
-    def __init__(self, message_type: int, message_payload):
+    def __init__(self, message_type: int, message_payload: bytes = b''):
         self.message_length = len(message_payload) + 1
         self.message_type = message_type
         self.message_payload = message_payload
     
     def encode(self):
-        return struct.pack(">I", self.message_length) + struct.pack("B", self.message_type) + struct.pack(self.message_payload)
+        return struct.pack(">I", self.message_length) + struct.pack("B", self.message_type) + self.message_payload
     @classmethod
     def decode(cls, data: bytes):
         if len(data) < 5:
