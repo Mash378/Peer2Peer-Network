@@ -13,3 +13,4 @@ backup/
 thefile
 peer_*
 log_peer*
+.venv

@@ -52,17 +52,22 @@ class Peer:
         self.peers_lock = threading.Lock()
         self.preferred_neighbors = set()
         self.optimistically_unchoked = None
-        
-        # File manager
+
         self.file_manager = FileManager(peer_id, config)
-        
-        # Verify file exists if we're supposed to have it.
-        if bitfield.all():
+
+        has_all_pieces = all(bitfield[i] for i in range(config.num_pieces))
+        if has_all_pieces:
             self.file_manager.create_file_from_pieces(bitfield)
-        
-        # Termination tracking
+
         self.running = True
         self.all_done = False
+        self.all_peers_complete_bitfields = {}
+        for pid in peer_info.get_all_peers():
+            if pid == peer_id:
+                self.all_peers_complete_bitfields[pid] = has_all_pieces
+            else:
+                other_peer_data = peer_info.get_peer(pid)
+                self.all_peers_complete_bitfields[pid] = other_peer_data['has_file']
 
         self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -74,32 +79,30 @@ class Peer:
     # This accepts incoming connections.
     def listen_for_connections(self):
         while self.running:
-            conn, addr = self.server_socket.accept() # Accept and establish TCP connection
+            conn, addr = self.server_socket.accept()
             print(f"Accepted connection from {addr}")
-            self.logger.log_connection_received("unknown")
-            # Start a new thread to handle communication with this peer
-            threading.Thread(target=self.handler, args=(conn, addr), daemon=True).start()
+            threading.Thread(target=self.handler, args=(conn, addr, True), daemon=True).start()
     
-    # This lets the user/client try to connect with other users.
     def connect_to_peers(self, peer_host, peer_port):
         conn = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         conn.connect((peer_host, peer_port))
         print(f"Connection successful with Peer at {peer_host}:{peer_port}")
-        threading.Thread(target=self.handler, args=(conn, (peer_host, peer_port)), daemon=True).start()
+        threading.Thread(target=self.handler, args=(conn, (peer_host, peer_port), False), daemon=True).start()
 
-    # This handles communication with a peer.
-    def handler(self, conn, addr):
+    def handler(self, conn, addr, is_incoming=False):
         peer_id = None
         try:
-            # === Handshake Message ===
             user_msg = handshake_message(self.peer_id)
-            conn.sendall(user_msg.encode())  # Send handshake message
-            data = conn.recv(32)  # Receive handshake message
+            conn.sendall(user_msg.encode())
+            data = conn.recv(32)
             peer_handshake_msg = handshake_message.decode(data)
             peer_id = peer_handshake_msg.Peer_ID
-            
+
             print(f"Handshake complete with peer {peer_id}")
-            self.logger.log_connection_made(peer_id)
+            if is_incoming:
+                self.logger.log_connection_received(peer_id)
+            else:
+                self.logger.log_connection_made(peer_id)
 
             peer_conn = PeerConnection(conn, peer_id, addr)  # Connection object
             self.peers[peer_id] = peer_conn
@@ -119,10 +122,11 @@ class Peer:
             peer_bitfield_msg = actual_message.decode(bitfield_data)
 
             if peer_bitfield_msg.message_payload:
-                # Check for interesting pieces
                 peer_bitfield = bitarray()
                 peer_bitfield.frombytes(peer_bitfield_msg.message_payload)
                 peer_conn.bitfield = peer_bitfield
+                has_all_pieces = all(peer_bitfield[i] for i in range(self.config.num_pieces))
+                self.all_peers_complete_bitfields[peer_id] = has_all_pieces
                 is_interested = self._has_interesting_pieces(peer_bitfield)
                 
                 # === Interest message ===
@@ -190,7 +194,7 @@ class Peer:
     
     # Check if peer has any pieces we're missing.
     def _has_interesting_pieces(self, peer_bitfield):
-        for i in range(min(len(peer_bitfield), len(self.bitfield))):
+        for i in range(self.config.num_pieces):
             if peer_bitfield[i] and not self.bitfield[i]:
                 return True
         return False
@@ -218,20 +222,46 @@ class Peer:
             peer_conn.is_interested_in_user = False
             self.logger.log_not_interested(peer_conn.peer_id)
             print(f"Peer {peer_conn.peer_id} is not interested")
-            
+
+        elif msg_type == BITFIELD:
+            if msg_payload:
+                peer_bitfield = bitarray()
+                peer_bitfield.frombytes(msg_payload)
+                peer_conn.bitfield = peer_bitfield
+                has_all_pieces = all(peer_bitfield[i] for i in range(self.config.num_pieces))
+                self.all_peers_complete_bitfields[peer_conn.peer_id] = has_all_pieces
+                print(f"Peer {peer_conn.peer_id} updated bitfield - has all pieces: {has_all_pieces}")
+                is_interested = self._has_interesting_pieces(peer_bitfield)
+                if is_interested and not peer_conn.interested_in_peer:
+                    interested_msg = actual_message(INTERESTED)
+                    peer_conn.conn.sendall(interested_msg.encode())
+                    peer_conn.interested_in_peer = True
+                    print(f"Now interested in peer {peer_conn.peer_id}")
+                    if not peer_conn.is_choking_user:
+                        self._send_request(peer_conn)
+                elif not is_interested and peer_conn.interested_in_peer:
+                    not_interested_msg = actual_message(NOT_INTERESTED)
+                    peer_conn.conn.sendall(not_interested_msg.encode())
+                    peer_conn.interested_in_peer = False
+                    print(f"No longer interested in peer {peer_conn.peer_id}")
+
         elif msg_type == HAVE:
             piece_index = struct.unpack(">I", msg_payload)[0]
             if peer_conn.bitfield:
                 peer_conn.bitfield[piece_index] = True
+            if peer_conn.bitfield:
+                has_all_pieces = all(peer_conn.bitfield[i] for i in range(self.config.num_pieces))
+                self.all_peers_complete_bitfields[peer_conn.peer_id] = has_all_pieces
             self.logger.log_have_received(peer_conn.peer_id, piece_index)
             print(f"Peer {peer_conn.peer_id} has piece {piece_index}")
-            
-            # Check if we're now interested.
+
             if not peer_conn.interested_in_peer and not self.bitfield[piece_index]:
                 interested_msg = actual_message(INTERESTED)
                 peer_conn.conn.sendall(interested_msg.encode())
                 peer_conn.interested_in_peer = True
                 print(f"Now interested in peer {peer_conn.peer_id}")
+                if not peer_conn.is_choking_user:
+                    self._send_request(peer_conn)
             
         elif msg_type == REQUEST:
             piece_index = struct.unpack(">I", msg_payload)[0]
@@ -264,15 +294,23 @@ class Peer:
                 
                 # Broadcast HAVE to all other peers.
                 self._broadcast_have(piece_index)
-                
-                # Check if we're done.
-                if self.bitfield.all():
+
+                has_all_pieces = all(self.bitfield[i] for i in range(self.config.num_pieces))
+                if has_all_pieces:
+                    self.all_peers_complete_bitfields[self.peer_id] = True
                     self.logger.log_download_complete()
                     print(f"Peer {self.peer_id} has downloaded the complete file")
+                    bitfield_bytes = self.bitfield.tobytes()
+                    bitfield_msg = actual_message(BITFIELD, bitfield_bytes)
+                    with self.peers_lock:
+                        for peer_conn in self.peers.values():
+                            try:
+                                peer_conn.conn.sendall(bitfield_msg.encode())
+                            except:
+                                pass
                     self._check_all_done()
                 else:
-                    # Check if still interested in this peer.
-                    if not self._has_interesting_pieces(peer_conn.bitfield):
+                    if peer_conn.bitfield and not self._has_interesting_pieces(peer_conn.bitfield):
                         not_interested_msg = actual_message(NOT_INTERESTED)
                         peer_conn.conn.sendall(not_interested_msg.encode())
                         peer_conn.interested_in_peer = False
@@ -287,11 +325,12 @@ class Peer:
     
     # Send a request for a piece to peer.
     def _send_request(self, peer_conn):
-        # Find a piece we need that peer has and we haven't requested yet.
+        if peer_conn.bitfield is None:
+            return
         available_pieces = []
         for i in range(len(self.bitfield)):
-            if (peer_conn.bitfield[i] and 
-                not self.bitfield[i] and 
+            if (peer_conn.bitfield[i] and
+                not self.bitfield[i] and
                 i not in peer_conn.requested_pieces):
                 available_pieces.append(i)
         
@@ -359,7 +398,8 @@ class Peer:
             return
         
         # If we have complete file, select randomly
-        if self.bitfield.all():
+        has_all_pieces = all(self.bitfield[i] for i in range(self.config.num_pieces))
+        if has_all_pieces:
             selected = random.sample(interested_peers, min(self.num_preferred_neighbors, len(interested_peers)))
             new_preferred = set(peer_id for peer_id, _ in selected)
         else:
@@ -368,11 +408,10 @@ class Peer:
             selected = interested_peers[:self.num_preferred_neighbors]
             new_preferred = set(peer_id for peer_id, _ in selected)
         
-        # Update preferred neighbors
         old_preferred = self.preferred_neighbors
         self.preferred_neighbors = new_preferred
-        
-        if new_preferred != self.preferred_neighbors:
+
+        if new_preferred != old_preferred:
             self.logger.log_preferred_neighbors(list(new_preferred))
             print(f"Preferred neighbors: {new_preferred}")
         
@@ -443,18 +482,20 @@ class Peer:
     def should_terminate(self):
         return self.all_done
     
-    # Check if all peers have complete file.
     def _check_all_done(self):
-        with self.peers_lock:
-            if not self.bitfield.all():
-                return False
-            
-            for peer_conn in self.peers.values():
-                if not (peer_conn.bitfield and peer_conn.bitfield.all()):
-                    return False
-        
+        has_all_pieces = all(self.bitfield[i] for i in range(self.config.num_pieces))
+        if not has_all_pieces:
+            print(f"Peer {self.peer_id}: does not have all pieces yet")
+            return
+
+        print(f"Peer {self.peer_id} checking completion: {self.all_peers_complete_bitfields}")
+        incomplete_peers = {pid: is_complete for pid, is_complete in self.all_peers_complete_bitfields.items() if not is_complete}
+        if incomplete_peers:
+            print(f"Peer {self.peer_id}: waiting for {incomplete_peers}")
+            return
+
         self.all_done = True
-        print(f"All peers have complete file")
+        print(f"Peer {self.peer_id}: ALL PEERS COMPLETE - TERMINATING")
     
     # Clean shutdown of peer.
     def shutdown(self):
