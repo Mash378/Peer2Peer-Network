@@ -17,3 +17,14 @@ In separate terminals run python peerProcess.py [peerId]
 The peers should connect and share the file and terminate when they are complete, if you look in the peer directories once finished they should all have the files. 
 
 #May need a virtual environment for the bitarray library
+
+# Group Members
+Joshua Kitaigorod    --->       peerProcess.py, config parsing, and a little bit of the peer class
+Mashroor Newaz       --->       protocol.py + peer.py
+Jason He             --->       logging function and error handling
+Zach Pinet           --->       peer.py
+
+
+Video Demonstration: https://uflorida-my.sharepoint.com/:v:/g/personal/mashroor_newaz_ufl_edu/IQA9Lx1FMfoaRJjzl57gHtobAceBT7eYnFLSYhHdK7YoLlg?nav=eyJyZWZlcnJhbEluZm8iOnsicmVmZXJyYWxBcHAiOiJPbmVEcml2ZUZvckJ1c2luZXNzIiwicmVmZXJyYWxBcHBQbGF0Zm9ybSI6IldlYiIsInJlZmVycmFsTW9kZSI6InZpZXciLCJyZWZlcnJhbFZpZXciOiJNeUZpbGVzTGlua0NvcHkifX0&e=PZrQTj
+
+Only people in university of Florida can access the video through the link.
